@@ -1,0 +1,6 @@
+[submodule "external/clap"]
+	path = external/clap
+	url = https://github.com/free-audio/clap.git
+[submodule "external/clap-helpers"]
+	path = external/clap-helpers
+	url = https://github.com/free-audio/clap-helpers.git
