@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.vanniktech.maven.publish)
+    signing
 }
 
 version = libs.versions.aap.clap.hosting.helper.get()

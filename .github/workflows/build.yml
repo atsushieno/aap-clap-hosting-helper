@@ -1,0 +1,66 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+jobs:
+  linux-build:
+    name: build on linux
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+      - name: cache Gradle caches
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.gradle/caches/
+          key: ${{ runner.os }}-gradle-caches
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          echo y | sudo apt-get install cmake ninja-build
+      - name: build
+        run: ./gradlew build publishToMavenLocal
+      - name: upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aap-clap-hosting-helper-apps-and-libs
+          path: |
+            ./*/build/outputs/aar/*.aar
+            samples/*/build/outputs/apk/debug/*.apk
+
+  osx-build:
+    name: build on osx
+    runs-on: macos-14
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+      - name: cache Gradle caches
+        uses: actions/cache@v4
+        with:
+          path: /Users/runner/.gradle/caches/
+          key: ${{ runner.os }}-gradle-caches
+      - name: install dependencies
+        run: |
+          brew install ninja
+      - name: build
+        run: ./gradlew build publishToMavenLocal
+        env:
+          ANDROID_SDK_ROOT: /Users/runner/Library/Android/sdk
