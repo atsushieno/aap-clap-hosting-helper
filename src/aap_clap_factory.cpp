@@ -148,8 +148,7 @@ const clap_plugin_t* AapClapFactory::createPlugin(const clap_host_t* host,
 
     if (!ensureServiceConnected()) return nullptr;
 
-    // Default sample rate 48000; actual rate is applied in AapClapPlugin::activate().
-    auto result = _client->createInstance(plugin_id, 48000, /*isRemoteExplicit=*/true);
+    auto result = _client->createInstance(plugin_id, /*isRemoteExplicit=*/true);
     if (!result.error.empty()) return nullptr;
 
     auto* instance = static_cast<aap::RemotePluginInstance*>(

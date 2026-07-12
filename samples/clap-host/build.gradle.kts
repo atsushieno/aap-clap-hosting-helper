@@ -56,6 +56,7 @@ android {
 
 dependencies {
     implementation(project(":aap-clap-hosting-helper"))
+    implementation(libs.aap.js.controller)
     implementation(libs.oboe)
     implementation(libs.compose.audio.controls)
     implementation(libs.core.ktx)

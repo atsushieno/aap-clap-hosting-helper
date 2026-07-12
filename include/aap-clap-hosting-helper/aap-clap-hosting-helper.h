@@ -68,6 +68,13 @@ uint32_t                       aap_clap_hosting_helper_get_entry_count(void);
 // Valid until aap_clap_hosting_helper_deinit() is called.
 const aap_clap_hosting_helper_entry_t* aap_clap_hosting_helper_get_entry(uint32_t index);
 
+// Native aap::PluginClient* handle owned by the helper. Intended for integrations
+// such as androidaudioplugin-js-controller that need to inspect the same host client.
+uintptr_t aap_clap_hosting_helper_get_native_client_handle(void);
+
+// Connects an AAP plugin service by package name using the helper's connection list.
+bool aap_clap_hosting_helper_connect_plugin_service(const char* package_name);
+
 
 #ifdef __cplusplus
 } // extern "C"

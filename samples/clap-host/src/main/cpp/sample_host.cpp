@@ -135,6 +135,19 @@ static std::mutex                    s_paramEventMu;
 static std::vector<ParamChangeEvent> s_paramEventBuf;
 static std::vector<ParamChangeEvent> s_paramEventAudio;
 
+struct ParamNotificationStats {
+    uint64_t processBlocks = 0;
+    uint64_t totalOutputEvents = 0;
+    uint64_t parameterValueEvents = 0;
+    clap_id lastParamId = CLAP_INVALID_ID;
+    double lastValue = 0.0;
+};
+
+static std::mutex s_paramNotificationStatsMu;
+static ParamNotificationStats s_paramNotificationStats;
+static std::mutex s_paramNotificationMu;
+static std::vector<ParamChangeEvent> s_paramNotificationBuf;
+
 static void pushParamEvent(clap_id id, double value) {
     std::lock_guard<std::mutex> lk(s_paramEventMu);
     s_paramEventBuf.push_back({id, value});
@@ -148,6 +161,44 @@ static const std::vector<ParamChangeEvent>& swapParamEvents() {
             std::swap(s_paramEventBuf, s_paramEventAudio);
     }
     return s_paramEventAudio;
+}
+
+static void resetParamNotificationStats() {
+    std::lock_guard<std::mutex> lk(s_paramNotificationStatsMu);
+    s_paramNotificationStats = {};
+    {
+        std::lock_guard<std::mutex> qlk(s_paramNotificationMu);
+        s_paramNotificationBuf.clear();
+    }
+}
+
+static void collectOutputEventStats(const clap::helpers::EventList& events) {
+    std::lock_guard<std::mutex> lk(s_paramNotificationStatsMu);
+    s_paramNotificationStats.processBlocks++;
+    s_paramNotificationStats.totalOutputEvents += events.size();
+
+    for (size_t i = 0; i < events.size(); i++) {
+        const clap_event_header_t* ev = events.get((uint32_t)i);
+        if (!ev || ev->type != CLAP_EVENT_PARAM_VALUE)
+            continue;
+
+        const auto* pv = reinterpret_cast<const clap_event_param_value_t*>(ev);
+        s_paramNotificationStats.parameterValueEvents++;
+        s_paramNotificationStats.lastParamId = pv->param_id;
+        s_paramNotificationStats.lastValue = pv->value;
+        {
+            std::lock_guard<std::mutex> qlk(s_paramNotificationMu);
+            s_paramNotificationBuf.push_back({pv->param_id, pv->value});
+        }
+
+        if (s_paramNotificationStats.parameterValueEvents <= 16) {
+            __android_log_print(ANDROID_LOG_INFO, TAG,
+                                "CLAP output parameter notification #%llu: id=%u value=%f",
+                                (unsigned long long)s_paramNotificationStats.parameterValueEvents,
+                                (uint32_t)pv->param_id,
+                                pv->value);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +303,7 @@ public:
         proc.out_events          = eventsOut.clapOutputEvents();
 
         plugin->process(&proc);
+        collectOutputEventStats(eventsOut);
         steadyTime += frameSize;
 
         // Write stereo interleaved float output to Oboe buffer.
@@ -353,6 +405,70 @@ Java_org_androidaudioplugin_claphosting_sample_MainActivity_discoverPlugins(
     return arr;
 }
 
+extern "C"
+JNIEXPORT jlong JNICALL
+Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeGetAutomationClientHandle(
+        JNIEnv*, jobject) {
+    return (jlong)aap_clap_hosting_helper_get_native_client_handle();
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeConnectPluginService(
+        JNIEnv* env, jobject, jstring packageName) {
+    if (!packageName) return JNI_FALSE;
+    const char* pkg = env->GetStringUTFChars(packageName, nullptr);
+    bool ok = pkg && aap_clap_hosting_helper_connect_plugin_service(pkg);
+    if (pkg) env->ReleaseStringUTFChars(packageName, pkg);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeGetAutomationCatalogJson(
+        JNIEnv* env, jobject) {
+    std::string json = "[";
+    bool first = true;
+    uint32_t nentries = aap_clap_hosting_helper_get_entry_count();
+
+    for (uint32_t i = 0; i < nentries; i++) {
+        const aap_clap_hosting_helper_entry_t* entry = aap_clap_hosting_helper_get_entry(i);
+        if (!entry) continue;
+
+        auto* factory = static_cast<const clap_plugin_factory_t*>(
+                entry->get_factory(entry, CLAP_PLUGIN_FACTORY_ID));
+        if (!factory) continue;
+
+        uint32_t nplugins = factory->get_plugin_count(factory);
+        for (uint32_t j = 0; j < nplugins; j++) {
+            const clap_plugin_descriptor_t* desc = factory->get_plugin_descriptor(factory, j);
+            if (!desc || !desc->id) continue;
+
+            auto appendJsonString = [&](const char* text) {
+                json += "\"";
+                for (const char* p = text ? text : ""; *p; ++p) {
+                    if (*p == '"' || *p == '\\') json += '\\';
+                    json += *p;
+                }
+                json += "\"";
+            };
+
+            if (!first) json += ",";
+            first = false;
+            json += "{\"pluginId\":";
+            appendJsonString(desc->id);
+            json += ",\"displayName\":";
+            appendJsonString(desc->name);
+            json += ",\"packageName\":";
+            appendJsonString(entry->package_name);
+            json += "}";
+        }
+    }
+
+    json += "]";
+    return env->NewStringUTF(json.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // nativeLoadPlugin — init + activate plugin, start Oboe stream
 // ---------------------------------------------------------------------------
@@ -380,6 +496,7 @@ Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeLoadPlugin(
     if (!desc) return JNI_FALSE;
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "Loading plugin: %s", desc->name ? desc->name : "?");
+    resetParamNotificationStats();
 
     auto engine = std::make_unique<SampleEngine>();
     engine->host      = std::make_unique<SampleCLAPHost>();
@@ -658,6 +775,77 @@ Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeGetParameters(
     return arr;
 }
 
+extern "C"
+JNIEXPORT jfloatArray JNICALL
+Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeGetParameterValues(
+        JNIEnv* env, jobject) {
+
+    SampleEngine* engine = s_engine;
+    if (!engine || !engine->plugin->canUseParams())
+        return env->NewFloatArray(0);
+
+    engine->host->updateMainThreadId();
+
+    uint32_t count = engine->plugin->paramsCount();
+    auto arr = env->NewFloatArray((jsize)count);
+    std::vector<jfloat> values(count);
+    for (uint32_t i = 0; i < count; i++) {
+        clap_param_info_t info{};
+        double value = 0.0;
+        if (engine->plugin->paramsGetInfo(i, &info) &&
+            engine->plugin->paramsGetValue(info.id, &value))
+            values[i] = (jfloat)value;
+    }
+    if (!values.empty())
+        env->SetFloatArrayRegion(arr, 0, (jsize)values.size(), values.data());
+    return arr;
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeGetParameterNotificationStats(
+        JNIEnv* env, jobject) {
+    ParamNotificationStats stats;
+    {
+        std::lock_guard<std::mutex> lk(s_paramNotificationStatsMu);
+        stats = s_paramNotificationStats;
+    }
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "blocks=%llu events=%llu paramEvents=%llu lastId=%u lastValue=%.9g",
+             (unsigned long long)stats.processBlocks,
+             (unsigned long long)stats.totalOutputEvents,
+             (unsigned long long)stats.parameterValueEvents,
+             stats.lastParamId == CLAP_INVALID_ID ? 0xFFFFFFFFu : (uint32_t)stats.lastParamId,
+             stats.lastValue);
+    return env->NewStringUTF(buf);
+}
+
+extern "C"
+JNIEXPORT jdoubleArray JNICALL
+Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeDrainParameterNotifications(
+        JNIEnv* env, jobject) {
+    std::vector<ParamChangeEvent> changes;
+    {
+        std::lock_guard<std::mutex> lk(s_paramNotificationMu);
+        changes.swap(s_paramNotificationBuf);
+    }
+
+    auto arr = env->NewDoubleArray((jsize)(changes.size() * 2));
+    if (changes.empty())
+        return arr;
+
+    std::vector<jdouble> flattened;
+    flattened.reserve(changes.size() * 2);
+    for (const auto& change : changes) {
+        flattened.push_back((jdouble)change.id);
+        flattened.push_back((jdouble)change.value);
+    }
+    env->SetDoubleArrayRegion(arr, 0, (jsize)flattened.size(), flattened.data());
+    return arr;
+}
+
 // ---------------------------------------------------------------------------
 // nativeSendParameterChange — queues a CLAP_EVENT_PARAM_VALUE for audio thread
 // ---------------------------------------------------------------------------
@@ -782,6 +970,8 @@ Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeSetPreset(
         JNIEnv* env, jobject, jstring loadKey) {
     SampleEngine* engine = s_engine;
     if (!engine || !loadKey) return;
+
+    engine->host->updateMainThreadId();
 
     const clap_plugin_t* rawPlugin = engine->plugin->clapPlugin();
     if (!rawPlugin) return;

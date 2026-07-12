@@ -28,7 +28,12 @@ AapClapPlugin::AapClapPlugin(const clap_plugin_descriptor_t* desc,
     _ump_scratch.reserve(UMP_SCRATCH_INITIAL);
 }
 
-AapClapPlugin::~AapClapPlugin() = default;
+AapClapPlugin::~AapClapPlugin() {
+    if (_client && _instance) {
+        _client->destroyInstance(_instance);
+        _instance = nullptr;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -169,7 +174,7 @@ bool AapClapPlugin::paramsInfo(uint32_t paramIndex,
 bool AapClapPlugin::paramsValue(clap_id paramId, double* value) noexcept {
     int32_t idx = paramIndexById(paramId);
     if (idx < 0) return false;
-    *value = _instance->getParameterValue(idx);
+    *value = _param_values[(size_t)idx];
     return true;
 }
 
@@ -213,7 +218,10 @@ bool AapClapPlugin::stateSave(const clap_ostream* stream) noexcept {
     if (sz < 0) return false;
     if (sz == 0) return true;
 
-    aap_state_t s = ext.getState();
+    auto result = ext.getState();
+    if (!result.isOk()) return false;
+
+    aap_state_t s = result.value;
     uint32_t u32sz = (uint32_t)s.data_size;
     if (stream->write(stream, &u32sz, 4) != 4) return false;
     int64_t written = stream->write(stream, s.data, (uint64_t)u32sz);
@@ -354,8 +362,8 @@ bool AapClapPlugin::presetLoadFromLocation(uint32_t location_kind,
     char* end = nullptr;
     long index = strtol(load_key, &end, 10);
     if (!end || end == load_key || *end != '\0' || index < 0) return false;
-    _instance->getStandardExtensions().setCurrentPresetIndex((int32_t)index);
-    return true;
+    auto result = _instance->getStandardExtensions().setCurrentPresetIndex((int32_t)index);
+    return result.isOk();
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +374,15 @@ int32_t AapClapPlugin::paramIndexById(clap_id id) const {
     for (int32_t i = 0; i < (int32_t)_param_cache.size(); i++)
         if ((clap_id)_param_cache[i].stable_id == id) return i;
     return -1;
+}
+
+bool AapClapPlugin::updateParamValue(clap_id id, double value) {
+    int32_t idx = paramIndexById(id);
+    if (idx < 0 || (size_t)idx >= _param_values.size()) return false;
+    const auto& p = _param_cache[(size_t)idx];
+    double clamped = std::clamp(value, p.min_value, p.max_value);
+    _param_values[(size_t)idx] = clamped;
+    return true;
 }
 
 void AapClapPlugin::injectInputEvents(const clap_input_events* in) {
@@ -389,6 +406,10 @@ void AapClapPlugin::injectInputEvents(const clap_input_events* in) {
         const clap_event_header_t* ev = in->get(in, i);
         if (!ev) continue;
         size_t written = midi2_bridge::clap_event_to_ump(ev, ump, remaining, _param_cache);
+        if (written > 0 && ev->type == CLAP_EVENT_PARAM_VALUE) {
+            const auto* pv = reinterpret_cast<const clap_event_param_value_t*>(ev);
+            updateParamValue(pv->param_id, pv->value);
+        }
         if (written == 0 && remaining < 16) {
             log(CLAP_LOG_WARNING, "UMP scratch buffer too small; some events dropped");
             break;
@@ -417,6 +438,34 @@ void AapClapPlugin::drainOutputEvents(const clap_output_events* out) {
     if (hdr->length == 0) return;
 
     const uint8_t* ump = raw + sizeof(AAPMidiBufferHeader);
+    const auto* ptr = reinterpret_cast<const uint32_t*>(ump);
+    uint32_t remaining = hdr->length / 4;
+    while (remaining > 0) {
+        uint32_t w0 = ptr[0];
+        int wcount = midi2_bridge::ump_word_count(w0);
+        if ((uint32_t)wcount > remaining) break;
+
+        if (((w0 >> 28) & 0xF) == 0x5 && wcount >= 4) {
+            uint8_t group, channel, key, extra;
+            uint16_t param_id;
+            uint32_t transport;
+            if (aapReadMidi2ParameterSysex8(&group, &channel, &key, &extra,
+                                             &param_id, &transport,
+                                             ptr[0], ptr[1], ptr[2], ptr[3])) {
+                int32_t idx = paramIndexById((clap_id)param_id);
+                if (idx >= 0) {
+                    const auto& pi = _param_cache[(size_t)idx];
+                    double normalized = aapParameterUint32ToNormalized(transport);
+                    double plain = aapParameterNormalizedToPlain(
+                            pi.min_value, pi.max_value, normalized);
+                    updateParamValue((clap_id)param_id, plain);
+                }
+            }
+        }
+
+        ptr += wcount;
+        remaining -= wcount;
+    }
+
     midi2_bridge::ump_to_clap_events(ump, hdr->length, out, _param_cache);
 }
-

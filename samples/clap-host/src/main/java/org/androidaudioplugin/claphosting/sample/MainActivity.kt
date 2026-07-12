@@ -3,6 +3,7 @@ package org.androidaudioplugin.claphosting.sample
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.SurfaceControl
 import android.view.SurfaceView
 import android.view.View
@@ -69,10 +70,12 @@ import kotlin.math.roundToInt
 import org.androidaudioplugin.composeaudiocontrols.DefaultKnobTooltip
 import org.androidaudioplugin.composeaudiocontrols.DiatonicKeyboardWithControllers
 import org.androidaudioplugin.composeaudiocontrols.ImageStripKnob
+import org.androidaudioplugin.js.AapAutomationRuntime
 
 class MainActivity : ComponentActivity() {
 
     companion object {
+        private const val TAG = "aap-clap-sample"
         const val FRAME_SIZE  = 1024
         const val SAMPLE_RATE = 48000
 
@@ -121,6 +124,7 @@ class MainActivity : ComponentActivity() {
 
         Thread {
             val rawList = discoverPlugins(applicationContext)
+            bootstrapJsController()
             val discovered = rawList.mapNotNull { s ->
                 val i1 = s.indexOf('|')
                 val i2 = s.indexOf('|', i1 + 1)
@@ -137,6 +141,49 @@ class MainActivity : ComponentActivity() {
                     "No AAP plugins found. Install some and relaunch."
                 else
                     "Select a plugin to play."
+            }
+        }.start()
+    }
+
+    private fun bootstrapJsController() {
+        try {
+            AapAutomationRuntime.bootstrap(applicationContext)
+            AapAutomationRuntime.attachNativeClient(nativeGetAutomationClientHandle())
+            AapAutomationRuntime.setPluginCatalog(nativeGetAutomationCatalogJson())
+            AapAutomationRuntime.serviceConnector = { packageName ->
+                nativeConnectPluginService(packageName)
+            }
+            Log.i(TAG, "AAP JS automation runtime initialized")
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to initialize AAP JS automation runtime", e)
+        }
+    }
+
+    private fun startParameterNotificationPolling(plugin: PluginEntry) {
+        Thread {
+            while (pluginLoaded && loadedPlugin == plugin) {
+                Thread.sleep(50)
+                val changes = nativeDrainParameterNotifications()
+                if (changes.isEmpty())
+                    continue
+
+                runOnUiThread {
+                    var i = 0
+                    var lastParamId = -1
+                    var lastValue = 0f
+                    while (i + 1 < changes.size) {
+                        val paramId = changes[i].toInt()
+                        val value = changes[i + 1].toFloat()
+                        val index = params.indexOfFirst { it.id == paramId }
+                        if (index >= 0 && index < paramValues.size)
+                            paramValues[index] = value
+                        lastParamId = paramId
+                        lastValue = value
+                        i += 2
+                    }
+                    if (lastParamId >= 0)
+                        statusText = "Parameter notification: id=$lastParamId value=$lastValue"
+                }
             }
         }.start()
     }
@@ -284,9 +331,11 @@ class MainActivity : ComponentActivity() {
                                         fun applyCrop(scrollX: Int, scrollY: Int, vpW: Int, vpH: Int) {
                                             val sc = v.surfaceControl ?: return
                                             if (!sc.isValid) return
-                                            SurfaceControl.Transaction()
-                                                .setCrop(sc, Rect(scrollX, scrollY, scrollX + vpW, scrollY + vpH))
-                                                .apply()
+                                            val crop = Rect(scrollX, scrollY, scrollX + vpW, scrollY + vpH)
+                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                                                SurfaceControl.Transaction()
+                                                    .setCrop(sc, crop)
+                                                    .apply()
                                         }
                                         val sx = effectiveScrollX; val sy = effectiveScrollY
                                         val vpW = viewportWidthPx; val vpH = viewportHeightPx
@@ -482,7 +531,21 @@ class MainActivity : ComponentActivity() {
                         onClick = {
                             expanded = false
                             selectedPresetIndex = index
-                            Thread { nativeSetPreset(preset.loadKey) }.start()
+                            Thread {
+                                nativeSetPreset(preset.loadKey)
+                                var stats = ""
+                                repeat(10) {
+                                    Thread.sleep(50)
+                                    val values = nativeGetParameterValues()
+                                    stats = nativeGetParameterNotificationStats()
+                                    runOnUiThread {
+                                        for (i in values.indices)
+                                            if (i < paramValues.size)
+                                                paramValues[i] = values[i]
+                                        statusText = "Preset: ${preset.name}  [$stats]"
+                                    }
+                                }
+                            }.start()
                         }
                     )
                 }
@@ -644,6 +707,7 @@ class MainActivity : ComponentActivity() {
                         else PresetItem(s.substring(0, tab), s.substring(tab + 1))
                     })
                     selectedPresetIndex = -1
+                    startParameterNotificationPolling(plugin)
                 } else {
                     statusText = "Failed to load ${plugin.label}"
                 }
@@ -675,7 +739,13 @@ class MainActivity : ComponentActivity() {
     private external fun nativeGetGuiSize(): LongArray
     private external fun nativeHideGui()
     private external fun nativeGetParameters(): Array<String?>
+    private external fun nativeGetParameterValues(): FloatArray
+    private external fun nativeGetParameterNotificationStats(): String
+    private external fun nativeDrainParameterNotifications(): DoubleArray
     private external fun nativeSendParameterChange(paramId: Int, value: Double)
     private external fun nativeGetPresets(): Array<String?>
     private external fun nativeSetPreset(loadKey: String)
+    private external fun nativeGetAutomationClientHandle(): Long
+    private external fun nativeGetAutomationCatalogJson(): String
+    private external fun nativeConnectPluginService(packageName: String): Boolean
 }

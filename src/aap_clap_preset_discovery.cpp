@@ -147,7 +147,7 @@ bool AapClapPresetDiscoveryProvider::getMetadata(
     if (!ensureConnected(_snapshot, _client, _connections, _plugin_id))
         return false;
 
-    auto result = _client->createInstance(_plugin_id.c_str(), 48000, /*isRemoteExplicit=*/true);
+    auto result = _client->createInstance(_plugin_id.c_str(), /*isRemoteExplicit=*/true);
     if (!result.error.empty()) return false;
 
     auto* instance = static_cast<aap::RemotePluginInstance*>(

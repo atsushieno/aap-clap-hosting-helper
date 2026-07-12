@@ -124,6 +124,7 @@ private:
 
     // Helpers
     int32_t paramIndexById(clap_id id) const;
+    bool    updateParamValue(clap_id id, double value);
     void    injectInputEvents(const clap_input_events* in);
     void    drainOutputEvents(const clap_output_events* out);
 };

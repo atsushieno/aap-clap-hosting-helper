@@ -1,7 +1,7 @@
 [versions]
 
-aap-clap-hosting-helper = "0.1.0"
-aap-core = "0.11.0"
+aap-clap-hosting-helper = "0.1.1"
+aap-core = "0.11.1"
 
 android-compileSdk = "37"
 android-minSdk = "29"
@@ -30,6 +30,7 @@ compose-audio-controls = "0.7.3"
 [libraries]
 
 aap-core = { module = "org.androidaudioplugin:androidaudioplugin", version.ref = "aap-core" }
+aap-js-controller = { module = "org.androidaudioplugin:androidaudioplugin-js-controller", version.ref = "aap-core" }
 
 core-ktx = { module = "androidx.core:core-ktx", version.ref = "core-ktx" }
 appcompat = { module = "androidx.appcompat:appcompat", version.ref = "appcompat" }

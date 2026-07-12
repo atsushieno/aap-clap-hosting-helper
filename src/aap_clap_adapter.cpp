@@ -1,11 +1,14 @@
 #include <aap-clap-hosting-helper/aap-clap-hosting-helper.h>
 #include <aap/core/host/plugin-connections.h>
 #include <aap/core/host/plugin-host.h>
+#include <aap/core/host/plugin-client-system.h>
 #include <aap/core/host/android/audio-plugin-host-android.h>
 #include <aap/core/android/android-application-context.h>
 #include "aap_clap_pkg_entry.h"
 #include <memory>
 #include <string>
+#include <condition_variable>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -99,4 +102,34 @@ uint32_t aap_clap_hosting_helper_get_entry_count(void) {
 const aap_clap_hosting_helper_entry_t* aap_clap_hosting_helper_get_entry(uint32_t index) {
     if (!g_adapter || index >= g_adapter->entry_ptrs.size()) return nullptr;
     return g_adapter->entry_ptrs[index];
+}
+
+uintptr_t aap_clap_hosting_helper_get_native_client_handle(void) {
+    if (!g_adapter || !g_adapter->client) return 0;
+    return reinterpret_cast<uintptr_t>(g_adapter->client.get());
+}
+
+bool aap_clap_hosting_helper_connect_plugin_service(const char* package_name) {
+    if (!g_adapter || !g_adapter->connections || !package_name || !package_name[0])
+        return false;
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+    std::string connect_error;
+    std::string pkg(package_name);
+
+    aap::PluginClientSystem::getInstance()->ensurePluginServiceConnected(
+            g_adapter->connections,
+            pkg,
+            [&](std::string& err) {
+                std::unique_lock<std::mutex> lk(m);
+                connect_error = err;
+                done = true;
+                cv.notify_one();
+            });
+
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [&]{ return done; });
+    return connect_error.empty();
 }
