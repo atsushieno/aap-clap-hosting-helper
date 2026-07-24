@@ -9,6 +9,7 @@ find_package(oboe REQUIRED CONFIG)
 
 add_library(sample-clap-host SHARED
     sample_host.cpp
+    clap_engine.cpp
 )
 
 # clap is a submodule in the aap-clap-hosting-helper repo; it is not packaged in the Prefab AAR,
