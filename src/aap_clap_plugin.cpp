@@ -29,6 +29,8 @@ AapClapPlugin::AapClapPlugin(const clap_plugin_descriptor_t* desc,
 }
 
 AapClapPlugin::~AapClapPlugin() {
+    if (_instance)
+        _instance->setBusesChangedHandler({});
     if (_client && _instance) {
         _client->destroyInstance(_instance);
         _instance = nullptr;
@@ -43,7 +45,12 @@ bool AapClapPlugin::init() noexcept {
     // completeInstantiation() and configurePorts() were already called by
     // PluginClient::createInstance(). Calling them again resets port state.
 
-    _ports = buffer_bridge::build_port_layout(_instance->getPluginInformation());
+    _ports = buffer_bridge::build_port_layout(_instance);
+    // Invoked on an AAP worker thread; CLAP audio-ports rescan has to happen on the main thread.
+    _instance->setBusesChangedHandler([this](uint32_t flags) {
+        _pending_bus_changes.fetch_or(flags);
+        _host.requestCallback();
+    });
 
     // Build an aap_parameter_info_t shadow cache so midi2_bridge can normalise
     // parameter values without needing an extension call per event.
@@ -74,6 +81,26 @@ bool AapClapPlugin::activate(double sample_rate,
 
 void AapClapPlugin::deactivate() noexcept {
     _instance->deactivate();
+    if (_pending_bus_changes.load())
+        _host.requestCallback();
+}
+
+void AapClapPlugin::onMainThread() noexcept {
+    auto flags = _pending_bus_changes.load();
+    if (!flags)
+        return;
+    // The ports can change only while deactivated; ask the host to restart us first.
+    if (isActive()) {
+        if (flags & AAP_BUSES_CHANGED_LAYOUT)
+            _host.requestRestart();
+        return;
+    }
+    _pending_bus_changes.store(0);
+    if (!_instance->refreshBusLayout().empty())
+        return;
+    _ports = buffer_bridge::build_port_layout(_instance);
+    if (_host.canUseAudioPorts())
+        _host.audioPortsRescan((flags & AAP_BUSES_CHANGED_LAYOUT) ? CLAP_AUDIO_PORTS_RESCAN_LIST : CLAP_AUDIO_PORTS_RESCAN_NAMES);
 }
 
 // ---------------------------------------------------------------------------
@@ -101,24 +128,23 @@ clap_process_status AapClapPlugin::process(const clap_process_t* p) noexcept {
 // ---------------------------------------------------------------------------
 
 uint32_t AapClapPlugin::audioPortsCount(bool isInput) const noexcept {
-    size_t n = isInput ? _ports.audio_in.size() : _ports.audio_out.size();
-    return (uint32_t)((n + 1) / 2);
+    return (uint32_t) (isInput ? _ports.audio_in.size() : _ports.audio_out.size());
 }
 
 bool AapClapPlugin::audioPortsInfo(uint32_t index, bool isInput,
                                     clap_audio_port_info* info) const noexcept {
-    const auto& portList = isInput ? _ports.audio_in : _ports.audio_out;
-    uint32_t first = index * 2;
-    if (first >= (uint32_t)portList.size()) return false;
+    const auto& buses = isInput ? _ports.audio_in : _ports.audio_out;
+    if (index >= buses.size()) return false;
 
-    bool stereo = (first + 1 < (uint32_t)portList.size());
-    info->id            = first;
-    info->flags         = (index == 0) ? CLAP_AUDIO_PORT_IS_MAIN : 0;
-    info->channel_count = stereo ? 2 : 1;
-    info->port_type     = stereo ? CLAP_PORT_STEREO : CLAP_PORT_MONO;
+    const auto& bus = buses[index];
+    info->id            = bus.id;
+    info->flags         = bus.main ? CLAP_AUDIO_PORT_IS_MAIN : 0;
+    info->channel_count = (uint32_t) bus.port_indices.size();
+    info->port_type     = bus.layout == AAP_BUS_LAYOUT_STEREO ? CLAP_PORT_STEREO
+                        : bus.layout == AAP_BUS_LAYOUT_MONO ? CLAP_PORT_MONO
+                        : nullptr;
     info->in_place_pair = CLAP_INVALID_ID;
-    snprintf(info->name, sizeof(info->name), "%s %u",
-             isInput ? "Audio In" : "Audio Out", index);
+    snprintf(info->name, sizeof(info->name), "%s", bus.name.c_str());
     return true;
 }
 

@@ -37,6 +37,7 @@ protected:
                   uint32_t min_frames,
                   uint32_t max_frames) noexcept override;
     void deactivate() noexcept override;
+    void onMainThread() noexcept override;
     bool startProcessing() noexcept override { return true; }
     void stopProcessing() noexcept override {}
     void reset() noexcept override {}
@@ -121,6 +122,9 @@ private:
     bool     _gui_connected{false};  // connectRemoteNativeView already called
     uint32_t _gui_width{0};
     uint32_t _gui_height{0};
+
+    // AAP_BUSES_CHANGED_* from the plugin, applied on the main thread when deactivated.
+    std::atomic<uint32_t> _pending_bus_changes{0};
 
     // Helpers
     int32_t paramIndexById(clap_id id) const;
