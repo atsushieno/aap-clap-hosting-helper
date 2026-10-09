@@ -13,6 +13,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -29,6 +30,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -114,6 +116,7 @@ class MainActivity : ComponentActivity() {
             WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
         )
 
+        enableEdgeToEdge()
         setContent {
             MaterialTheme {
                 MtSurface(modifier = Modifier.fillMaxSize()) {
@@ -233,7 +236,9 @@ class MainActivity : ComponentActivity() {
         }
 
         val noteOnStates = remember { List(128) { 0L }.toMutableStateList() }
-        Box(modifier = Modifier.fillMaxSize()) {
+        // Keep the controls (and the floating plugin UI) out of the system bars and cutouts,
+        // where touches would go to the system instead.
+        Box(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
             Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                 Text(text = statusText, fontSize = 13.sp,
                     modifier = Modifier.padding(bottom = 8.dp))
