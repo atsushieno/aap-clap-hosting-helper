@@ -163,6 +163,12 @@ class MainActivity : ComponentActivity() {
         Thread {
             while (pluginLoaded && loadedPlugin == plugin) {
                 Thread.sleep(50)
+                // The plugin's main-thread work (e.g. parameter metadata refresh) runs on the UI
+                // thread, which also unloads the plugin.
+                runOnUiThread {
+                    if (pluginLoaded && loadedPlugin == plugin && nativeIdle())
+                        refreshParameters()
+                }
                 val changes = nativeDrainParameterNotifications()
                 if (changes.isEmpty())
                     continue
@@ -186,6 +192,29 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }.start()
+    }
+
+    private fun parseParameters(rawParams: Array<String?>) = rawParams.mapNotNull { s ->
+        val parts = s?.split("|") ?: return@mapNotNull null
+        if (parts.size < 5) return@mapNotNull null
+        ParamInfo(
+            id      = parts[0].toIntOrNull() ?: return@mapNotNull null,
+            name    = parts[1],
+            min     = parts[2].toFloatOrNull() ?: 0f,
+            max     = parts[3].toFloatOrNull() ?: 1f,
+            default = parts[4].toFloatOrNull() ?: 0f
+        )
+    }
+
+    // Re-reads the parameter list after the plugin rescanned its parameters.
+    private fun refreshParameters() {
+        val parsed = parseParameters(nativeGetParameters())
+        val values = nativeGetParameterValues()
+        params.clear()
+        params.addAll(parsed)
+        paramValues.clear()
+        paramValues.addAll(parsed.indices.map { values.getOrElse(it) { parsed[it].default } })
+        statusText = "Parameters updated (${parsed.size})"
     }
 
     // ---------------------------------------------------------------------------
@@ -533,12 +562,15 @@ class MainActivity : ComponentActivity() {
                             selectedPresetIndex = index
                             Thread {
                                 nativeSetPreset(preset.loadKey)
-                                var stats = ""
                                 repeat(10) {
                                     Thread.sleep(50)
-                                    val values = nativeGetParameterValues()
-                                    stats = nativeGetParameterNotificationStats()
+                                    // Parameter values are read on the UI thread, which is
+                                    // where the plugin's main-thread work happens too.
                                     runOnUiThread {
+                                        if (!pluginLoaded)
+                                            return@runOnUiThread
+                                        val values = nativeGetParameterValues()
+                                        val stats = nativeGetParameterNotificationStats()
                                         for (i in values.indices)
                                             if (i < paramValues.size)
                                                 paramValues[i] = values[i]
@@ -684,17 +716,7 @@ class MainActivity : ComponentActivity() {
                     hasGui = nativePluginHasGui()
                     statusText = "Playing: ${plugin.label}" +
                                  if (hasGui) "  [has GUI]" else ""
-                    val parsed = rawParams.mapNotNull { s ->
-                        val parts = s?.split("|") ?: return@mapNotNull null
-                        if (parts.size < 5) return@mapNotNull null
-                        ParamInfo(
-                            id      = parts[0].toIntOrNull() ?: return@mapNotNull null,
-                            name    = parts[1],
-                            min     = parts[2].toFloatOrNull() ?: 0f,
-                            max     = parts[3].toFloatOrNull() ?: 1f,
-                            default = parts[4].toFloatOrNull() ?: 0f
-                        )
-                    }
+                    val parsed = parseParameters(rawParams)
                     params.clear()
                     params.addAll(parsed)
                     paramValues.clear()
@@ -738,6 +760,7 @@ class MainActivity : ComponentActivity() {
     private external fun nativeGetGuiView(): Any?
     private external fun nativeGetGuiSize(): LongArray
     private external fun nativeHideGui()
+    private external fun nativeIdle(): Boolean
     private external fun nativeGetParameters(): Array<String?>
     private external fun nativeGetParameterValues(): FloatArray
     private external fun nativeGetParameterNotificationStats(): String

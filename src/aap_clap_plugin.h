@@ -12,6 +12,7 @@
 #include <aap/ext/gui.h>
 #include "buffer_bridge.h"
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -61,7 +62,9 @@ protected:
 
     // clap_plugin_params
     bool implementsParams() const noexcept override {
-        return _instance->getNumParameters() > 0;
+        // A plugin with the parameters extension may publish parameters later.
+        return _instance->getNumParameters() > 0 ||
+               _instance->getPluginInformation()->hasExtension(AAP_PARAMETERS_EXTENSION_URI);
     }
     uint32_t paramsCount() const noexcept override;
     bool paramsInfo(uint32_t paramIndex, clap_param_info* info) const noexcept override;
@@ -109,7 +112,8 @@ private:
     // Port layout built from PluginInformation in init()
     buffer_bridge::PortLayout _ports;
 
-    // Parameter cache built from PluginInformation in init()
+    // Parameter cache built from the instance's published parameters in init(),
+    // and rebuilt on the main thread when the plugin refreshes its parameter metadata.
     std::vector<aap_parameter_info_t> _param_cache;
     std::vector<double>               _param_values;
 
@@ -123,10 +127,19 @@ private:
     uint32_t _gui_width{0};
     uint32_t _gui_height{0};
 
+    // The configuration that the instance was last prepared with.
+    int32_t _prepared_max_frames{0};
+    int32_t _prepared_sample_rate{0};
+
     // AAP_BUSES_CHANGED_* from the plugin, applied on the main thread when deactivated.
     std::atomic<uint32_t> _pending_bus_changes{0};
+    // Set when the plugin published new parameter metadata, applied on the main thread.
+    std::atomic<bool> _pending_param_changes{false};
 
     // Helpers
+    std::vector<aap_parameter_info_t> buildParameterCache();
+    void    applyParameterChanges();
+    void    applyBusChanges();
     int32_t paramIndexById(clap_id id) const;
     bool    updateParamValue(clap_id id, double value);
     void    injectInputEvents(const clap_input_events* in);

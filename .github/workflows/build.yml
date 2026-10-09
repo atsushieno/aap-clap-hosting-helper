@@ -1,9 +1,26 @@
 name: build
 
+# aap-clap-hosting-helper depends on aap-core that is often not published yet,
+# so we build aap-core from source and publish it to mavenLocal first.
+# Trigger manually (or via workflow_call) to build against another aap-core ref.
+
 on:
   push:
   pull_request:
   workflow_call:
+    inputs:
+      aap_core_ref:
+        description: 'aap-core git ref to build against (branch / tag / sha)'
+        required: false
+        type: string
+        default: 'main'
+  workflow_dispatch:
+    inputs:
+      aap_core_ref:
+        description: 'aap-core git ref to build against (branch / tag / sha)'
+        required: false
+        type: string
+        default: 'main'
 
 jobs:
   linux-build:
@@ -14,10 +31,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: set up JDK 17
+      # inputs are empty on push and pull_request.
+      - name: checkout aap-core
+        uses: actions/checkout@v4
+        with:
+          repository: atsushieno/aap-core
+          ref: ${{ inputs.aap_core_ref || 'main' }}
+          submodules: recursive
+          path: external/aap-core
+      - name: set up JDK 21
         uses: actions/setup-java@v4
         with:
-          java-version: 17
+          java-version: 21
           distribution: temurin
       - name: cache Gradle caches
         uses: actions/cache@v4
@@ -28,6 +53,9 @@ jobs:
         run: |
           sudo apt-get update
           echo y | sudo apt-get install cmake ninja-build
+      - name: publish aap-core to mavenLocal
+        working-directory: external/aap-core
+        run: ./gradlew :androidaudioplugin:publishToMavenLocal :androidaudioplugin-js-controller:publishToMavenLocal
       - name: build
         run: ./gradlew build publishToMavenLocal
       - name: upload artifact
@@ -47,10 +75,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: set up JDK 17
+      # inputs are empty on push and pull_request.
+      - name: checkout aap-core
+        uses: actions/checkout@v4
+        with:
+          repository: atsushieno/aap-core
+          ref: ${{ inputs.aap_core_ref || 'main' }}
+          submodules: recursive
+          path: external/aap-core
+      - name: set up JDK 21
         uses: actions/setup-java@v4
         with:
-          java-version: 17
+          java-version: 21
           distribution: temurin
       - name: cache Gradle caches
         uses: actions/cache@v4
@@ -60,6 +96,11 @@ jobs:
       - name: install dependencies
         run: |
           brew install ninja
+      - name: publish aap-core to mavenLocal
+        working-directory: external/aap-core
+        env:
+          ANDROID_SDK_ROOT: /Users/runner/Library/Android/sdk
+        run: ./gradlew :androidaudioplugin:publishToMavenLocal :androidaudioplugin-js-controller:publishToMavenLocal
       - name: build
         run: ./gradlew build publishToMavenLocal
         env:

@@ -49,13 +49,27 @@ std::string buildAutomationCatalogJson();
 bool engineLoadPlugin(uint32_t entryIdx, uint32_t pluginIdx, int32_t sampleRate, int32_t frameSize);
 
 // Deactivates and destroys the loaded plugin, if any. The caller must have
-// already stopped audio processing (engineStopProcessing(), called from the
-// audio thread) and guaranteed no further engineProcessBlock() calls before
-// calling this.
+// already stopped its audio stream and guaranteed no further
+// engineProcessBlock() calls before calling this; processing is stopped here
+// if the audio callback did not get to call engineStopProcessing().
 void engineUnloadPlugin();
 
 bool engineIsLoaded();
 bool engineHasGui();
+
+// Must be called periodically on the main thread. Runs clap_plugin::on_main_thread() when the
+// plugin requested it, and returns true if the plugin rescanned its parameters since the last
+// call (the caller should then re-read engineGetParameters()).
+bool engineIdle();
+
+// Returns true (once) if the plugin requested a restart (clap_host::request_restart).
+bool engineTakeRestartRequest();
+
+// Must be called on the main thread, after the caller stopped its audio stream (no further
+// engineProcessBlock() calls). Stops processing if still started, deactivates the
+// plugin, lets it apply its pending changes, re-reads the audio ports and activates it again.
+// Returns false if the plugin failed to re-activate.
+bool engineRestartPlugin();
 
 // --- Audio-thread-only API --------------------------------------------------
 // Must all be invoked from the caller's audio callback thread, consistently

@@ -10,6 +10,7 @@
 #include <clap/factory/preset-discovery.h>
 #include <clap/ext/preset-load.h>
 
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -62,10 +63,26 @@ public:
         return _audioThreadSet && std::this_thread::get_id() == _audioThreadId;
     }
 
+    // Set from any thread, serviced by engineIdle() on the main thread.
+    std::atomic<bool> callbackRequested{false};
+    // Set when the plugin rescanned its parameters, consumed by engineIdle().
+    std::atomic<bool> paramsRescanned{false};
+    // Set from any thread, consumed by engineTakeRestartRequest().
+    std::atomic<bool> restartRequested{false};
+
 protected:
-    void requestRestart()  noexcept override {}
+    void requestRestart() noexcept override {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "Plugin requested restart");
+        restartRequested.store(true);
+    }
     void requestProcess()  noexcept override {}
-    void requestCallback() noexcept override {}
+    void requestCallback() noexcept override { callbackRequested.store(true); }
+
+    bool implementsParams() const noexcept override { return true; }
+    void paramsRescan(clap_param_rescan_flags flags) noexcept override {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "Plugin rescanned parameters (flags=0x%x)", flags);
+        paramsRescanned.store(true);
+    }
 
     bool implementsLog() const noexcept override { return true; }
     void logLog(clap_log_severity severity, const char* msg) const noexcept override {
@@ -212,6 +229,7 @@ class SampleEngine {
 public:
     std::unique_ptr<SampleCLAPHost>    host;
     std::unique_ptr<SamplePluginProxy> plugin;
+    int     sampleRate       = 0;
     int     frameSize        = 0;
     int     entryIdx         = -1;   // index into aap_clap_hosting_helper entries
     int64_t steadyTime       = 0;
@@ -231,6 +249,16 @@ public:
 
 // Global engine instance (at most one loaded plugin at a time).
 SampleEngine* s_engine = nullptr;
+
+// The caller's audio stream is already closed, and its callback may have stopped before it
+// could call engineStopProcessing(). Since nothing processes anymore, the calling thread takes
+// over as the audio thread to stop processing before deactivate().
+void ensureProcessingStopped(SampleEngine* engine) {
+    if (!engine->processingStarted) return;
+    engine->host->markAudioThread();
+    engine->plugin->stopProcessing();
+    engine->processingStarted = false;
+}
 
 // Query audio ports via PluginProxy after init(), allocate sample buffers.
 void setupAudioPorts(SamplePluginProxy* proxy, bool isInput,
@@ -398,7 +426,8 @@ bool engineLoadPlugin(uint32_t entryIdx, uint32_t pluginIdx, int32_t sampleRate,
 
     auto engine = std::make_unique<SampleEngine>();
     engine->host      = std::make_unique<SampleCLAPHost>();
-    engine->frameSize = frameSize;
+    engine->sampleRate = sampleRate;
+    engine->frameSize  = frameSize;
     engine->entryIdx  = (int)entryIdx;
 
     const clap_plugin_t* rawPlugin =
@@ -458,6 +487,7 @@ void engineUnloadPlugin() {
             try { engine->plugin->guiDestroy(); } catch (...) {}
             engine->guiCreated = false;
         }
+        ensureProcessingStopped(engine);
         engine->plugin->deactivate();
         engine->plugin->destroy();
     }
@@ -467,6 +497,45 @@ void engineUnloadPlugin() {
 }
 
 bool engineIsLoaded() { return s_engine != nullptr; }
+
+bool engineIdle() {
+    SampleEngine* engine = s_engine;
+    if (!engine) return false;
+
+    if (engine->host->callbackRequested.exchange(false)) {
+        engine->host->updateMainThreadId();
+        engine->plugin->onMainThread();
+    }
+    return engine->host->paramsRescanned.exchange(false);
+}
+
+bool engineTakeRestartRequest() {
+    SampleEngine* engine = s_engine;
+    return engine && engine->host->restartRequested.exchange(false);
+}
+
+bool engineRestartPlugin() {
+    SampleEngine* engine = s_engine;
+    if (!engine) return false;
+
+    engine->host->updateMainThreadId();
+    ensureProcessingStopped(engine);
+    engine->plugin->deactivate();
+    // The plugin applies the changes that needed the restart in its main-thread callback.
+    if (engine->host->callbackRequested.exchange(false))
+        engine->plugin->onMainThread();
+
+    // The audio ports may have changed as well.
+    setupAudioPorts(engine->plugin.get(), true,  engine->frameSize, engine->audioIn,  engine->clapAudioIn);
+    setupAudioPorts(engine->plugin.get(), false, engine->frameSize, engine->audioOut, engine->clapAudioOut);
+
+    if (!engine->plugin->activate((double)engine->sampleRate, (uint32_t)engine->frameSize, (uint32_t)engine->frameSize)) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "plugin re-activate failed");
+        return false;
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "Plugin restarted");
+    return true;
+}
 
 void engineMarkAudioThread() {
     if (s_engine) s_engine->host->markAudioThread();

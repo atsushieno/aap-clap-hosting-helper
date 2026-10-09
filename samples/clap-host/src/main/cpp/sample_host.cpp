@@ -65,6 +65,47 @@ void closeOboeStream() {
     s_callback.reset();
 }
 
+int32_t s_sampleRate{0};
+int32_t s_frameSize{0};
+
+// Opens and starts the Oboe stream that drives the loaded plugin.
+bool openOboeStream(int32_t sampleRate, int32_t frameSize) {
+    s_sampleRate = sampleRate;
+    s_frameSize  = frameSize;
+    s_callback = std::make_unique<OboeCallback>();
+
+    oboe::AudioStreamBuilder builder;
+    builder.setDirection(oboe::Direction::Output)
+           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+           ->setSharingMode(oboe::SharingMode::Exclusive)
+           ->setFormat(oboe::AudioFormat::Float)
+           ->setChannelCount(2)
+           ->setSampleRate(sampleRate)
+           ->setFramesPerDataCallback(frameSize)
+           ->setDataCallback(s_callback.get())
+           ->setErrorCallback(s_callback.get());
+
+    oboe::Result result = builder.openStream(s_stream);
+    if (result != oboe::Result::OK) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "Oboe openStream failed: %s",
+                            oboe::convertToText(result));
+        s_callback.reset();
+        return false;
+    }
+
+    result = s_stream->requestStart();
+    if (result != oboe::Result::OK) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "Oboe requestStart failed: %s",
+                            oboe::convertToText(result));
+        s_stream->close();
+        s_stream.reset();
+        s_callback.reset();
+        return false;
+    }
+
+    return true;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -131,35 +172,7 @@ Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeLoadPlugin(
     if (!engineLoadPlugin((uint32_t)entryIdx, (uint32_t)pluginIdx, sampleRate, frameSize))
         return JNI_FALSE;
 
-    s_callback = std::make_unique<OboeCallback>();
-
-    oboe::AudioStreamBuilder builder;
-    builder.setDirection(oboe::Direction::Output)
-           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-           ->setSharingMode(oboe::SharingMode::Exclusive)
-           ->setFormat(oboe::AudioFormat::Float)
-           ->setChannelCount(2)
-           ->setSampleRate((int32_t)sampleRate)
-           ->setFramesPerDataCallback((int32_t)frameSize)
-           ->setDataCallback(s_callback.get())
-           ->setErrorCallback(s_callback.get());
-
-    oboe::Result result = builder.openStream(s_stream);
-    if (result != oboe::Result::OK) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "Oboe openStream failed: %s",
-                            oboe::convertToText(result));
-        s_callback.reset();
-        engineUnloadPlugin();
-        return JNI_FALSE;
-    }
-
-    result = s_stream->requestStart();
-    if (result != oboe::Result::OK) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "Oboe requestStart failed: %s",
-                            oboe::convertToText(result));
-        s_stream->close();
-        s_stream.reset();
-        s_callback.reset();
+    if (!openOboeStream(sampleRate, frameSize)) {
         engineUnloadPlugin();
         return JNI_FALSE;
     }
@@ -251,6 +264,25 @@ Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeUnloadPlugin(
         JNIEnv*, jobject) {
     closeOboeStream();
     engineUnloadPlugin();
+}
+
+// ---------------------------------------------------------------------------
+// nativeIdle — services main-thread callbacks and restart requests; true if parameters were rescanned
+// ---------------------------------------------------------------------------
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeIdle(
+        JNIEnv*, jobject) {
+    bool paramsRescanned = engineIdle();
+    if (engineTakeRestartRequest()) {
+        closeOboeStream();
+        bool restarted = engineRestartPlugin();
+        paramsRescanned |= engineIdle();
+        if (!restarted || !openOboeStream(s_sampleRate, s_frameSize))
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to restart the plugin");
+    }
+    return paramsRescanned ? JNI_TRUE : JNI_FALSE;
 }
 
 // ---------------------------------------------------------------------------

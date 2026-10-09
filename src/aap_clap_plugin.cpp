@@ -52,50 +52,115 @@ bool AapClapPlugin::init() noexcept {
         _host.requestCallback();
     });
 
-    // Build an aap_parameter_info_t shadow cache so midi2_bridge can normalise
-    // parameter values without needing an extension call per event.
-    int32_t nparams = _instance->getNumParameters();
-    _param_cache.reserve(nparams);
-    _param_values.reserve(nparams);
-    for (int32_t i = 0; i < nparams; i++) {
-        const aap::ParameterInformation* pi = _instance->getParameter(i);
-        aap_parameter_info_t info{};
-        info.stable_id     = (int16_t)pi->getId();
-        info.min_value     = pi->getMinimumValue();
-        info.max_value     = pi->getMaximumValue();
-        info.default_value = pi->getDefaultValue();
-        strncpy(info.display_name, pi->getName(), AAP_MAX_PARAMETER_NAME_CHARS - 1);
-        _param_cache.push_back(info);
-        _param_values.push_back(pi->getDefaultValue());
-    }
+    // Invoked on the AAP extension worker after the instance published refreshed parameter
+    // metadata; CLAP params rescan has to happen on the main thread.
+    _instance->parametersChangedHandler = [this](aap::RemotePluginInstance&) {
+        _pending_param_changes.store(true);
+        _host.requestCallback();
+    };
+
+    _param_cache = buildParameterCache();
+    _param_values.clear();
+    _param_values.reserve(_param_cache.size());
+    for (const auto& p : _param_cache)
+        _param_values.push_back(p.default_value);
     return true;
 }
 
 bool AapClapPlugin::activate(double sample_rate,
                               uint32_t /*min_frames*/,
                               uint32_t max_frames) noexcept {
-    _instance->prepare((int)max_frames, (int32_t)sample_rate);
+    // The instance has to be prepared first, and again after refreshBusLayout() (UNPREPARED).
+    // A prepared instance can be prepared again with another configuration only in bus mode.
+    bool configChanged = (int32_t)max_frames != _prepared_max_frames ||
+                         (int32_t)sample_rate != _prepared_sample_rate;
+    auto state = _instance->getInstanceState();
+    if (state == aap::PLUGIN_INSTANTIATION_STATE_INACTIVE && configChanged && !_instance->isBusMode()) {
+        log(CLAP_LOG_ERROR, "The plugin cannot be activated with another sample rate or block size");
+        return false;
+    }
+    if (state == aap::PLUGIN_INSTANTIATION_STATE_UNPREPARED || configChanged) {
+        _instance->prepare((int)max_frames, (int32_t)sample_rate);
+        _prepared_max_frames = (int32_t)max_frames;
+        _prepared_sample_rate = (int32_t)sample_rate;
+    }
+    if (_instance->getInstanceState() != aap::PLUGIN_INSTANTIATION_STATE_INACTIVE)
+        return false;
     _instance->activate();
     return true;
 }
 
 void AapClapPlugin::deactivate() noexcept {
     _instance->deactivate();
-    if (_pending_bus_changes.load())
+    if (_pending_bus_changes.load() || _pending_param_changes.load())
         _host.requestCallback();
 }
 
 void AapClapPlugin::onMainThread() noexcept {
-    auto flags = _pending_bus_changes.load();
+    applyParameterChanges();
+    applyBusChanges();
+}
+
+void AapClapPlugin::applyParameterChanges() {
+    if (!_pending_param_changes.exchange(false))
+        return;
+
+    auto params = buildParameterCache();
+    bool layoutChanged = params.size() != _param_cache.size();
+    for (size_t i = 0; !layoutChanged && i < params.size(); i++) {
+        const auto& a = params[i];
+        const auto& b = _param_cache[i];
+        layoutChanged = a.stable_id != b.stable_id || a.min_value != b.min_value ||
+                        a.max_value != b.max_value || a.default_value != b.default_value;
+    }
+
+    if (!layoutChanged) {
+        // Only names changed. The audio thread does not read them, so update them in place.
+        bool infoChanged = false;
+        for (size_t i = 0; i < params.size(); i++) {
+            if (strcmp(params[i].display_name, _param_cache[i].display_name) == 0)
+                continue;
+            memcpy(_param_cache[i].display_name, params[i].display_name, sizeof(params[i].display_name));
+            infoChanged = true;
+        }
+        if (infoChanged && _host.canUseParams())
+            _host.paramsRescan(CLAP_PARAM_RESCAN_INFO);
+        return;
+    }
+
+    // The parameter list and ranges are read on the audio thread, and CLAP_PARAM_RESCAN_ALL
+    // is valid only while deactivated; ask the host to restart us first.
+    if (isActive()) {
+        _pending_param_changes.store(true);
+        _host.requestRestart();
+        return;
+    }
+
+    // Keep the current values of the parameters that still exist.
+    std::vector<double> values;
+    values.reserve(params.size());
+    for (const auto& p : params) {
+        int32_t idx = paramIndexById((clap_id)p.stable_id);
+        values.push_back(idx >= 0 ? std::clamp(_param_values[(size_t)idx], p.min_value, p.max_value)
+                                  : p.default_value);
+    }
+    _param_cache = std::move(params);
+    _param_values = std::move(values);
+    if (_host.canUseParams())
+        _host.paramsRescan(CLAP_PARAM_RESCAN_ALL);
+}
+
+void AapClapPlugin::applyBusChanges() {
+    auto flags = _pending_bus_changes.exchange(0);
     if (!flags)
         return;
     // The ports can change only while deactivated; ask the host to restart us first.
     if (isActive()) {
+        _pending_bus_changes.fetch_or(flags);
         if (flags & AAP_BUSES_CHANGED_LAYOUT)
             _host.requestRestart();
         return;
     }
-    _pending_bus_changes.store(0);
     if (!_instance->refreshBusLayout().empty())
         return;
     _ports = buffer_bridge::build_port_layout(_instance);
@@ -240,16 +305,20 @@ bool AapClapPlugin::implementsState() const noexcept {
 
 bool AapClapPlugin::stateSave(const clap_ostream* stream) noexcept {
     auto& ext = _instance->getStandardExtensions();
-    int32_t sz = ext.getStateSize();
-    if (sz < 0) return false;
-    if (sz == 0) return true;
+    auto size = ext.getStateSize();
+    if (!size.isOk()) return false;
 
-    auto result = ext.getState();
-    if (!result.isOk()) return false;
+    aap_state_t s{nullptr, 0};
+    if (size.value > 0) {
+        auto result = ext.getState();
+        if (!result.isOk()) return false;
+        s = result.value;
+    }
 
-    aap_state_t s = result.value;
+    // An empty state is still written as a zero length so that stateLoad() can read it back.
     uint32_t u32sz = (uint32_t)s.data_size;
     if (stream->write(stream, &u32sz, 4) != 4) return false;
+    if (u32sz == 0) return true;
     int64_t written = stream->write(stream, s.data, (uint64_t)u32sz);
     return written == (int64_t)u32sz;
 }
@@ -257,13 +326,13 @@ bool AapClapPlugin::stateSave(const clap_ostream* stream) noexcept {
 bool AapClapPlugin::stateLoad(const clap_istream* stream) noexcept {
     uint32_t u32sz = 0;
     if (stream->read(stream, &u32sz, 4) != 4) return false;
+    if (u32sz == 0) return true;
 
     std::vector<uint8_t> buf(u32sz);
     int64_t got = stream->read(stream, buf.data(), u32sz);
     if (got != (int64_t)u32sz) return false;
 
-    _instance->getStandardExtensions().setState(buf.data(), (int32_t)u32sz);
-    return true;
+    return _instance->getStandardExtensions().setState(buf.data(), (int32_t)u32sz).isOk();
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +464,26 @@ bool AapClapPlugin::presetLoadFromLocation(uint32_t location_kind,
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+std::vector<aap_parameter_info_t> AapClapPlugin::buildParameterCache() {
+    // An aap_parameter_info_t shadow cache so that midi2_bridge can normalise
+    // parameter values without needing an extension call per event.
+    std::vector<aap_parameter_info_t> ret;
+    int32_t nparams = _instance->getNumParameters();
+    ret.reserve((size_t)std::max(nparams, 0));
+    for (int32_t i = 0; i < nparams; i++) {
+        const aap::ParameterInformation* pi = _instance->getParameter(i);
+        if (!pi) continue;
+        aap_parameter_info_t info{};
+        info.stable_id     = (int16_t)pi->getId();
+        info.min_value     = pi->getMinimumValue();
+        info.max_value     = pi->getMaximumValue();
+        info.default_value = pi->getDefaultValue();
+        strncpy(info.display_name, pi->getName(), AAP_MAX_PARAMETER_NAME_CHARS - 1);
+        ret.push_back(info);
+    }
+    return ret;
+}
 
 int32_t AapClapPlugin::paramIndexById(clap_id id) const {
     for (int32_t i = 0; i < (int32_t)_param_cache.size(); i++)
