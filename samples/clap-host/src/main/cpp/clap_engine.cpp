@@ -69,6 +69,9 @@ public:
     std::atomic<bool> paramsRescanned{false};
     // Set from any thread, consumed by engineTakeRestartRequest().
     std::atomic<bool> restartRequested{false};
+    // The plugin UI size requested by the plugin (clap_host_gui.request_resize), consumed by
+    // engineTakeGuiResizeRequest(). 0 = no request.
+    std::atomic<uint64_t> guiResizeRequest{0};
 
 protected:
     void requestRestart() noexcept override {
@@ -77,6 +80,12 @@ protected:
     }
     void requestProcess()  noexcept override {}
     void requestCallback() noexcept override { callbackRequested.store(true); }
+
+    bool implementsGui() const noexcept override { return true; }
+    bool guiRequestResize(uint32_t width, uint32_t height) noexcept override {
+        guiResizeRequest.store(((uint64_t) width << 32) | height);
+        return true;
+    }
 
     bool implementsParams() const noexcept override { return true; }
     void paramsRescan(clap_param_rescan_flags flags) noexcept override {
@@ -509,6 +518,15 @@ bool engineIdle() {
     return engine->host->paramsRescanned.exchange(false);
 }
 
+bool engineTakeGuiResizeRequest(uint32_t* width, uint32_t* height) {
+    SampleEngine* engine = s_engine;
+    uint64_t request = engine ? engine->host->guiResizeRequest.exchange(0) : 0;
+    if (!request) return false;
+    *width = (uint32_t) (request >> 32);
+    *height = (uint32_t) request;
+    return true;
+}
+
 bool engineTakeRestartRequest() {
     SampleEngine* engine = s_engine;
     return engine && engine->host->restartRequested.exchange(false);
@@ -638,68 +656,66 @@ void engineProcessBlock(float* out, int32_t numFrames) {
 
 bool engineHasGui() { return s_engine && s_engine->hasGui; }
 
-bool engineShowGui() {
-    SampleEngine* engine = s_engine;
-    if (!engine || !engine->hasGui) return false;
-
-    engine->host->updateMainThreadId();
-
-    if (!engine->guiCreated) {
-        if (!engine->plugin->guiCreate(CLAP_WINDOW_API_AAP_GUI, false)) {
-            __android_log_print(ANDROID_LOG_ERROR, TAG, "guiCreate failed");
-            return false;
-        }
-        engine->guiCreated = true;
-    }
-
-    // ptr=nullptr: starts the async SurfaceControlViewHost connection only.
-    // The SurfaceView handle is retrieved on the main thread by engineGetGuiViewHandle().
-    clap_window_t clapWin{};
-    clapWin.api = CLAP_WINDOW_API_AAP_GUI;
-    clapWin.ptr = nullptr;
-
-    try {
-        if (!engine->plugin->guiSetParent(&clapWin))
-            __android_log_print(ANDROID_LOG_WARN, TAG, "guiSetParent returned false");
-        if (!engine->plugin->guiShow()) {
-            __android_log_print(ANDROID_LOG_WARN, TAG, "guiShow returned false");
-            return false;
-        }
-    } catch (const std::exception& e) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "GUI show failed: %s", e.what());
-        return false;
-    }
-
-    __android_log_print(ANDROID_LOG_INFO, TAG, "GUI connection started");
-    return true;
-}
-
-// MUST be called on the Android main thread. Returns the SurfaceView owned by
-// AudioPluginSurfaceControlClient (an Android jobject exposed as void*).
-void* engineGetGuiViewHandle() {
-    SampleEngine* engine = s_engine;
-    if (!engine || !engine->guiCreated) return nullptr;
-
-    // guiSetParent with ptr!=nullptr skips connectRemoteNativeView (already done) and
-    // writes the SurfaceView into the provided slot.
-    void* surfaceViewSlot = nullptr;
-    clap_window_t win{};
-    win.api = CLAP_WINDOW_API_AAP_GUI;
-    win.ptr = &surfaceViewSlot;
-    engine->plugin->guiSetParent(&win);
-
-    __android_log_print(ANDROID_LOG_INFO, TAG, "engineGetGuiViewHandle: SurfaceView=%p", surfaceViewSlot);
-    return surfaceViewSlot;
-}
-
-void engineGetGuiSize(uint32_t* width, uint32_t* height) {
+void* engineCreateGui(uint32_t* width, uint32_t* height) {
     *width = 0;
     *height = 0;
     SampleEngine* engine = s_engine;
-    if (engine && engine->guiCreated) {
-        engine->plugin->guiGetSize(width, height);
-        __android_log_print(ANDROID_LOG_INFO, TAG, "engineGetGuiSize: %ux%u", *width, *height);
+    if (!engine || !engine->hasGui) return nullptr;
+
+    engine->host->updateMainThreadId();
+    if (!engine->guiCreated) {
+        if (!engine->plugin->guiCreate(CLAP_WINDOW_API_AAP_GUI, false)) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "guiCreate failed");
+            return nullptr;
+        }
+        engine->guiCreated = true;
     }
+    // It fails if the plugin does not tell its UI size; the caller chooses one then.
+    if (!engine->plugin->guiGetSize(width, height))
+        *width = *height = 0;
+
+    // The plugin writes its SurfaceView into the slot.
+    void* surfaceView = nullptr;
+    clap_window_t window{};
+    window.api = CLAP_WINDOW_API_AAP_GUI;
+    window.ptr = &surfaceView;
+    if (!engine->plugin->guiSetParent(&window) || !surfaceView) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "guiSetParent failed");
+        engineHideGui();
+        return nullptr;
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "GUI created: content size %ux%u", *width, *height);
+    return surfaceView;
+}
+
+bool engineConfigureGuiViewport(uint32_t viewportWidth, uint32_t viewportHeight,
+                                uint32_t contentWidth, uint32_t contentHeight,
+                                uint32_t scrollX, uint32_t scrollY) {
+    SampleEngine* engine = s_engine;
+    if (!engine || !engine->guiCreated) return false;
+
+    engine->host->updateMainThreadId();
+    const clap_plugin_t* rawPlugin = engine->plugin->clapPlugin();
+    auto* ext = static_cast<const aap_clap_plugin_gui_viewport_t*>(
+            rawPlugin->get_extension(rawPlugin, AAP_CLAP_EXT_GUI_VIEWPORT));
+    if (ext)
+        return ext->configure(rawPlugin, viewportWidth, viewportHeight,
+                              contentWidth, contentHeight, scrollX, scrollY);
+    // Without the extension the whole content goes into the window.
+    return engine->plugin->guiSetSize(viewportWidth, viewportHeight);
+}
+
+bool engineShowGui() {
+    SampleEngine* engine = s_engine;
+    if (!engine || !engine->guiCreated) return false;
+
+    engine->host->updateMainThreadId();
+    if (!engine->plugin->guiShow()) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "guiShow failed");
+        return false;
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "GUI shown");
+    return true;
 }
 
 void engineHideGui() {
@@ -707,8 +723,8 @@ void engineHideGui() {
     if (!engine || !engine->guiCreated) return;
 
     engine->host->updateMainThreadId();
-    try { engine->plugin->guiHide(); } catch (...) {}
-    try { engine->plugin->guiDestroy(); } catch (...) {}
+    engine->plugin->guiHide();
+    engine->plugin->guiDestroy();
     engine->guiCreated = false;
     __android_log_print(ANDROID_LOG_INFO, TAG, "GUI hidden and destroyed");
 }

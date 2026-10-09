@@ -13,8 +13,21 @@
 #include "buffer_bridge.h"
 
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
+
+// The state of a plugin UI preferred size query, shared with its worker thread (which may
+// outlive the plugin).
+struct AapClapGuiSizeQuery {
+    std::mutex         mutex;
+    const clap_host_t* host{nullptr};  // null once the plugin is destroyed
+    bool               done{false};
+    bool               applied{false};
+    int32_t            width{0};
+    int32_t            height{0};
+};
 
 class AapClapPlugin final : public clap::helpers::Plugin<
     clap::helpers::MisbehaviourHandler::Ignore,
@@ -30,6 +43,14 @@ public:
         return static_cast<AapClapPlugin&>(from(p));
     }
     aap::RemotePluginInstance& instance() { return *_instance; }
+
+    // AAP_CLAP_EXT_GUI_VIEWPORT
+    bool configureGuiViewport(uint32_t viewport_width, uint32_t viewport_height,
+                              uint32_t content_width, uint32_t content_height,
+                              uint32_t scroll_x, uint32_t scroll_y) noexcept {
+        return guiConfigureViewport(viewport_width, viewport_height, content_width, content_height,
+                                    scroll_x, scroll_y);
+    }
 
 protected:
     // clap_plugin lifecycle
@@ -105,6 +126,9 @@ protected:
     bool guiShow() noexcept override;
     bool guiHide() noexcept override;
 
+    // AAP_CLAP_EXT_GUI_VIEWPORT and other extensions clap-helpers does not know.
+    const void* extension(const char* id) noexcept override;
+
 private:
     aap::RemotePluginInstance* _instance;
     aap::PluginClient*         _client;
@@ -124,8 +148,23 @@ private:
     // GUI state
     bool     _gui_created{false};
     bool     _gui_connected{false};  // connectRemoteNativeView already called
-    uint32_t _gui_width{0};
-    uint32_t _gui_height{0};
+    // The plugin UI content size (its preferred size, or what the host set), and the viewport.
+    uint32_t _gui_content_width{0};
+    uint32_t _gui_content_height{0};
+    uint32_t _gui_viewport_width{0};
+    uint32_t _gui_viewport_height{0};
+    uint32_t _gui_scroll_x{0};
+    uint32_t _gui_scroll_y{0};
+    // The plugin UI preferred size is queried on a worker thread, because the query waits for a
+    // service binding that Android delivers on the main thread. The result is applied on the
+    // main thread (onMainThread()), which asks the host to resize (clap_host_gui.request_resize).
+    std::shared_ptr<AapClapGuiSizeQuery> _gui_size_query;
+    void     guiStartSizeQuery() noexcept;
+    void     guiApplySizeQuery() noexcept;
+    bool     guiConfigureViewport(uint32_t viewport_width, uint32_t viewport_height,
+                                  uint32_t content_width, uint32_t content_height,
+                                  uint32_t scroll_x, uint32_t scroll_y) noexcept;
+    void     guiApplyViewport() noexcept;
 
     // The configuration that the instance was last prepared with.
     int32_t _prepared_max_frames{0};

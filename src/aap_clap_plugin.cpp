@@ -5,9 +5,12 @@
 #include <clap/helpers/plugin.hxx>
 #include <aap/ext/midi.h>
 #include <aap/ext/gui.h>
+#include <aap/core/android/android-application-context.h>
+#include <jni.h>
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <thread>
 
 // Reserve enough UMP scratch space for one full block of CLAP events.
 // 64 CLAP events × 16 bytes (max UMP packet) = 1024 bytes. We use 4096 to be safe.
@@ -29,6 +32,11 @@ AapClapPlugin::AapClapPlugin(const clap_plugin_descriptor_t* desc,
 }
 
 AapClapPlugin::~AapClapPlugin() {
+    if (_gui_size_query) {
+        // The query worker may still be running; it must not call back into the host anymore.
+        std::lock_guard<std::mutex> lock{_gui_size_query->mutex};
+        _gui_size_query->host = nullptr;
+    }
     if (_instance)
         _instance->setBusesChangedHandler({});
     if (_client && _instance) {
@@ -99,6 +107,7 @@ void AapClapPlugin::deactivate() noexcept {
 void AapClapPlugin::onMainThread() noexcept {
     applyParameterChanges();
     applyBusChanges();
+    guiApplySizeQuery();
 }
 
 void AapClapPlugin::applyParameterChanges() {
@@ -358,27 +367,118 @@ bool AapClapPlugin::guiCreate(const char* api, bool isFloating) noexcept {
     if (!guiIsApiSupported(api, isFloating)) return false;
     _instance->prepareSurfaceControlForRemoteNativeUI();
     _gui_created = true;
+    _gui_content_width = _gui_content_height = 0;
+    _gui_viewport_width = _gui_viewport_height = 0;
+    _gui_scroll_x = _gui_scroll_y = 0;
+    if (!_gui_size_query)
+        guiStartSizeQuery();
+    else {
+        // It was queried for an earlier GUI; apply it again.
+        std::lock_guard<std::mutex> lock{_gui_size_query->mutex};
+        if (_gui_size_query->done && _gui_size_query->width > 0 && _gui_size_query->height > 0) {
+            _gui_content_width  = (uint32_t) _gui_size_query->width;
+            _gui_content_height = (uint32_t) _gui_size_query->height;
+        }
+    }
     return true;
+}
+
+// Runs AudioPluginSurfaceControlClient.getPreferredSize() on its own thread. It only touches its
+// own references, so that it can outlive the plugin instance.
+static void query_preferred_size(std::shared_ptr<AapClapGuiSizeQuery> query,
+                                 jobject controlClient, std::string packageName,
+                                 std::string pluginId, int32_t instanceId) {
+    int32_t width = 0, height = 0;
+    auto jvm = aap::get_android_jvm();
+    JNIEnv* env{nullptr};
+    if (jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+        jclass cls = env->GetObjectClass(controlClient);
+        jmethodID getPreferredSize = env->GetMethodID(cls, "getPreferredSize", "(Ljava/lang/String;Ljava/lang/String;I)[I");
+        if (getPreferredSize) {
+            jstring jPackageName = env->NewStringUTF(packageName.c_str());
+            jstring jPluginId = env->NewStringUTF(pluginId.c_str());
+            auto result = (jintArray) env->CallObjectMethod(controlClient, getPreferredSize, jPackageName, jPluginId, instanceId);
+            if (!env->ExceptionCheck() && result && env->GetArrayLength(result) >= 2) {
+                jint values[2]{};
+                env->GetIntArrayRegion(result, 0, 2, values);
+                width = values[0];
+                height = values[1];
+            }
+            if (result)
+                env->DeleteLocalRef(result);
+            env->DeleteLocalRef(jPluginId);
+            env->DeleteLocalRef(jPackageName);
+        }
+        if (env->ExceptionCheck())
+            env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+        env->DeleteGlobalRef(controlClient);
+        jvm->DetachCurrentThread();
+    }
+
+    std::lock_guard<std::mutex> lock{query->mutex};
+    query->done = true;
+    query->width = width;
+    query->height = height;
+    if (query->host)
+        query->host->request_callback(query->host);
+}
+
+void AapClapPlugin::guiStartSizeQuery() noexcept {
+    auto controller = _instance->getNativeUIController();
+    if (!controller || !controller->getHandle())
+        return;
+    JNIEnv* env{nullptr};
+    if (aap::get_android_jvm()->AttachCurrentThread(&env, nullptr) != JNI_OK)
+        return;
+    jobject controlClient = env->NewGlobalRef((jobject) controller->getHandle());
+
+    _gui_size_query = std::make_shared<AapClapGuiSizeQuery>();
+    _gui_size_query->host = _host.host();
+    auto info = _instance->getPluginInformation();
+    std::thread(query_preferred_size, _gui_size_query, controlClient,
+                info->getPluginPackageName(), info->getPluginID(), _instance->getInstanceId()).detach();
+}
+
+void AapClapPlugin::guiApplySizeQuery() noexcept {
+    if (!_gui_size_query) return;
+    int32_t width, height;
+    {
+        std::lock_guard<std::mutex> lock{_gui_size_query->mutex};
+        if (!_gui_size_query->done || _gui_size_query->applied)
+            return;
+        _gui_size_query->applied = true;
+        width = _gui_size_query->width;
+        height = _gui_size_query->height;
+    }
+    if (!_gui_created || width <= 0 || height <= 0)
+        return;
+    // The plugin UI content has this size; the host resizes the viewport (via set_size() or
+    // AAP_CLAP_EXT_GUI_VIEWPORT) accordingly.
+    _gui_content_width  = (uint32_t) width;
+    _gui_content_height = (uint32_t) height;
+    if (_host.canUseGui())
+        _host.guiRequestResize((uint32_t) width, (uint32_t) height);
 }
 
 void AapClapPlugin::guiDestroy() noexcept {
     if (!_gui_created) return;
-    // No explicit destroy call in RemotePluginInstance; cleanup happens in dtor.
-    _gui_created    = false;
-    _gui_connected  = false;
-    _gui_width      = 0;
-    _gui_height     = 0;
+    if (auto controller = _instance->getNativeUIController())
+        controller->hide();
+    // The SurfaceControl client lives as long as the instance; the next show() reconnects.
+    _gui_created         = false;
+    _gui_connected       = false;
+    _gui_content_width   = 0;
+    _gui_content_height  = 0;
+    _gui_viewport_width  = 0;
+    _gui_viewport_height = 0;
 }
 
 bool AapClapPlugin::guiGetSize(uint32_t* width, uint32_t* height) noexcept {
-    int32_t w = 0, h = 0;
-    if (_gui_created && _instance->getRemoteNativeViewPreferredSize(w, h)) {
-        *width  = (uint32_t)w;
-        *height = (uint32_t)h;
-    } else {
-        *width  = _gui_width  > 0 ? _gui_width  : 400;
-        *height = _gui_height > 0 ? _gui_height : 300;
-    }
+    if (!_gui_created || _gui_content_width == 0 || _gui_content_height == 0)
+        return false;
+    *width  = _gui_content_width;
+    *height = _gui_content_height;
     return true;
 }
 
@@ -397,47 +497,86 @@ bool AapClapPlugin::guiAdjustSize(uint32_t* width, uint32_t* height) noexcept {
 }
 
 bool AapClapPlugin::guiSetSize(uint32_t width, uint32_t height) noexcept {
-    _gui_width  = width;
-    _gui_height = height;
+    // Without the viewport extension, the content is shown as a whole in the window.
+    return guiConfigureViewport(width, height, width, height, 0, 0);
+}
+
+bool AapClapPlugin::guiConfigureViewport(uint32_t viewport_width, uint32_t viewport_height,
+                                         uint32_t content_width, uint32_t content_height,
+                                         uint32_t scroll_x, uint32_t scroll_y) noexcept {
+    if (!_gui_created || viewport_width == 0 || viewport_height == 0 ||
+        content_width == 0 || content_height == 0)
+        return false;
+    _gui_viewport_width  = viewport_width;
+    _gui_viewport_height = viewport_height;
+    _gui_content_width   = content_width;
+    _gui_content_height  = content_height;
+    _gui_scroll_x        = scroll_x;
+    _gui_scroll_y        = scroll_y;
+    guiApplyViewport();
     return true;
+}
+
+void AapClapPlugin::guiApplyViewport() noexcept {
+    // Before connection the configuration is kept; show() applies it.
+    if (!_gui_connected) return;
+    _instance->configureRemoteNativeView(
+            (int32_t) _gui_viewport_width, (int32_t) _gui_viewport_height,
+            (int32_t) _gui_content_width, (int32_t) _gui_content_height,
+            (int32_t) _gui_scroll_x, (int32_t) _gui_scroll_y);
 }
 
 bool AapClapPlugin::guiSetParent(const clap_window* window) noexcept {
     if (!window || strcmp(window->api, CLAP_WINDOW_API_AAP_GUI) != 0) return false;
     if (!_gui_created) return false;
-
-    // connectRemoteNativeView starts the async SurfaceControlViewHost connection.
-    // Call it only once — it must run on any JNI-attached thread but need not be main.
-    // getRemoteNativeView() returns a jobject (SurfaceView), which is only safe to
-    // hand to the Android UI framework from the main thread.  The caller therefore
-    // passes ptr==nullptr here (background thread, connection setup) and calls
-    // guiSetParent a second time with ptr!=nullptr from the main thread to retrieve
-    // the view handle.  The second call skips connectRemoteNativeView via the guard.
-    if (!_gui_connected) {
-        int32_t w = (int32_t)_gui_width, h = (int32_t)_gui_height;
-        if (w <= 0 || h <= 0)
-            _instance->getRemoteNativeViewPreferredSize(w, h);
-        if (w <= 0) w = 400;
-        if (h <= 0) h = 300;
-        _instance->connectRemoteNativeView(w, h);
-        _gui_connected = true;
-    }
-
-    // Write the SurfaceView handle into the host-provided output slot.
-    // Only called when ptr != nullptr, i.e. from the main thread.
+    // Hand the SurfaceView to the host. The connection is made at show(), once the host
+    // has attached the view to its window.
     if (window->ptr)
         *static_cast<void**>(window->ptr) = _instance->getRemoteNativeView();
     return true;
 }
 
 bool AapClapPlugin::guiShow() noexcept {
-    // Visibility is managed by the host embedding/removing the SurfaceView.
-    return _gui_created;
+    if (!_gui_created || _gui_content_width == 0 || _gui_content_height == 0)
+        return false;
+    if (!_gui_connected) {
+        // Connect at the full content size so the plugin lays out its whole UI; the viewport
+        // configuration then tells which region to show. (The connection waits for the
+        // SurfaceView to get attached to a display.)
+        _instance->connectRemoteNativeView((int32_t) _gui_content_width, (int32_t) _gui_content_height);
+        _gui_connected = true;
+        guiApplyViewport();
+    }
+    if (auto controller = _instance->getNativeUIController())
+        controller->show();
+    return true;
 }
 
 bool AapClapPlugin::guiHide() noexcept {
-    // Visibility is managed by the host embedding/removing the SurfaceView.
-    return _gui_created;
+    if (!_gui_created) return false;
+    if (auto controller = _instance->getNativeUIController())
+        controller->hide();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Extensions not covered by clap-helpers
+// ---------------------------------------------------------------------------
+
+static bool gui_viewport_configure(const clap_plugin_t* plugin,
+                                   uint32_t viewport_width, uint32_t viewport_height,
+                                   uint32_t content_width, uint32_t content_height,
+                                   uint32_t scroll_x, uint32_t scroll_y) {
+    return AapClapPlugin::fromPlugin(plugin).configureGuiViewport(
+            viewport_width, viewport_height, content_width, content_height, scroll_x, scroll_y);
+}
+
+static const aap_clap_plugin_gui_viewport_t gui_viewport_extension{ gui_viewport_configure };
+
+const void* AapClapPlugin::extension(const char* id) noexcept {
+    if (strcmp(id, AAP_CLAP_EXT_GUI_VIEWPORT) == 0 && implementsGui())
+        return &gui_viewport_extension;
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------

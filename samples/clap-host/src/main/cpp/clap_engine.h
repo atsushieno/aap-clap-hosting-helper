@@ -95,17 +95,29 @@ void engineStopProcessing();
 // engine's configured block size (from engineLoadPlugin) is written.
 void engineProcessBlock(float* out, int32_t numFrames);
 
-// Creates the plugin GUI and starts the async SurfaceControlViewHost
-// connection (AAP GUI window API). Safe to call from a background thread.
+// --- GUI (CLAP_WINDOW_API_AAP_GUI) ------------------------------------------
+// All of them must be called on the main (UI) thread.
+
+// Creates the plugin GUI and returns its SurfaceView (an Android jobject, exposed
+// as void* so this header stays JNI-free), or nullptr. `width`/`height` receive
+// the plugin UI content size, or 0 if the plugin does not tell it.
+void* engineCreateGui(uint32_t* width, uint32_t* height);
+
+// Sets the viewport (the SurfaceView size), the content size and the scroll
+// position of the plugin UI, via AAP_CLAP_EXT_GUI_VIEWPORT.
+bool engineConfigureGuiViewport(uint32_t viewportWidth, uint32_t viewportHeight,
+                                uint32_t contentWidth, uint32_t contentHeight,
+                                uint32_t scrollX, uint32_t scrollY);
+
+// Connects and shows the plugin UI. Call it once the SurfaceView is attached to
+// the window.
 bool engineShowGui();
 
-// Must be called on the main thread. Returns the raw window handle the
-// plugin wrote via guiSetParent (an Android jobject under the hood, exposed
-// here as void* so this header stays JNI-free); nullptr if unavailable.
-void* engineGetGuiViewHandle();
-
-void engineGetGuiSize(uint32_t* width, uint32_t* height);
 void engineHideGui();
+
+// Returns true (once) with the size if the plugin asked to resize its UI
+// (clap_host_gui.request_resize), e.g. when it found out its preferred size.
+bool engineTakeGuiResizeRequest(uint32_t* width, uint32_t* height);
 
 void engineSendNoteOn(int32_t key);
 void engineSendNoteOff(int32_t key);

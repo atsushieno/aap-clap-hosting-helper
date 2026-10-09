@@ -200,7 +200,8 @@ Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeSendNoteOff(
 }
 
 // ---------------------------------------------------------------------------
-// nativePluginHasGui / nativeShowGui / nativeHideGui
+// nativePluginHasGui / nativeCreateGui / nativeConfigureGuiViewport /
+// nativeShowGui / nativeHideGui — GUI calls, all on the Android main thread
 // ---------------------------------------------------------------------------
 
 extern "C"
@@ -210,10 +211,30 @@ Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativePluginHasGui(
     return engineHasGui() ? JNI_TRUE : JNI_FALSE;
 }
 
-// nativeShowGui — AAPXS setup only (safe to call from a background thread).
-// Calls guiCreate / guiSetParent / guiShow via Binder IPC and starts the
-// async SurfaceControlViewHost connection. The SurfaceView is NOT fetched
-// here; use nativeGetGuiView() on the main thread afterwards.
+// Returns the plugin's SurfaceView (or null), and writes the plugin UI content size
+// (0 if the plugin does not tell it) into size[0] and size[1].
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeCreateGui(
+        JNIEnv* env, jobject, jintArray size) {
+    uint32_t w = 0, h = 0;
+    void* surfaceView = engineCreateGui(&w, &h);
+    jint buf[2] = {(jint) w, (jint) h};
+    env->SetIntArrayRegion(size, 0, 2, buf);
+    return surfaceView ? env->NewLocalRef(static_cast<jobject>(surfaceView)) : nullptr;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeConfigureGuiViewport(
+        JNIEnv*, jobject, jint viewportWidth, jint viewportHeight,
+        jint contentWidth, jint contentHeight, jint scrollX, jint scrollY) {
+    return engineConfigureGuiViewport((uint32_t) viewportWidth, (uint32_t) viewportHeight,
+                                      (uint32_t) contentWidth, (uint32_t) contentHeight,
+                                      (uint32_t) scrollX, (uint32_t) scrollY) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Call it once the SurfaceView is attached to the window.
 extern "C"
 JNIEXPORT jboolean JNICALL
 Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeShowGui(
@@ -221,37 +242,24 @@ Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeShowGui(
     return engineShowGui() ? JNI_TRUE : JNI_FALSE;
 }
 
-// nativeGetGuiView — MUST be called on the Android main thread.
-// Returns the SurfaceView owned by AudioPluginSurfaceControlClient.
-// Calling on the main thread ensures the View is created on the correct thread.
-// The host must embed this view; the SurfaceControlViewHost connection
-// (started by nativeShowGui) completes once the view is attached to a window.
-extern "C"
-JNIEXPORT jobject JNICALL
-Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeGetGuiView(
-        JNIEnv* env, jobject) {
-    void* surfaceView = engineGetGuiViewHandle();
-    if (!surfaceView) return nullptr;
-    return env->NewLocalRef(static_cast<jobject>(surfaceView));
-}
-
-extern "C"
-JNIEXPORT jlongArray JNICALL
-Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeGetGuiSize(
-        JNIEnv* env, jobject) {
-    uint32_t w = 0, h = 0;
-    engineGetGuiSize(&w, &h);
-    jlongArray result = env->NewLongArray(2);
-    jlong buf[2] = {(jlong)w, (jlong)h};
-    env->SetLongArrayRegion(result, 0, 2, buf);
-    return result;
-}
-
 extern "C"
 JNIEXPORT void JNICALL
 Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeHideGui(
         JNIEnv*, jobject) {
     engineHideGui();
+}
+
+// Returns true with the size in size[0] and size[1] if the plugin asked to resize its UI.
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_androidaudioplugin_claphosting_sample_MainActivity_nativeTakeGuiResizeRequest(
+        JNIEnv* env, jobject, jintArray size) {
+    uint32_t w = 0, h = 0;
+    if (!engineTakeGuiResizeRequest(&w, &h))
+        return JNI_FALSE;
+    jint buf[2] = {(jint) w, (jint) h};
+    env->SetIntArrayRegion(size, 0, 2, buf);
+    return JNI_TRUE;
 }
 
 // ---------------------------------------------------------------------------

@@ -13,15 +13,34 @@
 //   window.ptr is a void** (pointer to a void* slot allocated by the host).
 //
 // On a successful set_parent() call the plugin writes the Android SurfaceView
-// (jobject) into *window.ptr.  The host must embed that SurfaceView in its
-// layout; the SurfaceControlViewHost connection completes automatically once
-// the view is attached to a live window.  Pass ptr == nullptr to skip the
-// view-handle handoff (e.g. when reconnecting after a size change).
+// (jobject) into *window.ptr. The host embeds that SurfaceView in its layout,
+// sized to the viewport (see AAP_CLAP_EXT_GUI_VIEWPORT), and calls show() once
+// it is attached to a window; show() connects the plugin UI to the SurfaceView.
+// All of them have to be called on the Android main (UI) thread.
+//
+// get_size() returns the plugin UI content size. It returns false if the plugin
+// does not tell its preferred size; the host then chooses one (e.g. its own
+// content area) and passes it to set_size() before show().
 #define CLAP_WINDOW_API_AAP_GUI "aap/gui/v4"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Plugin extension for CLAP_WINDOW_API_AAP_GUI. The plugin UI content can be larger than the
+// SurfaceView (the viewport); the plugin renders the region of its content at the scroll
+// position into the viewport, as the AAP GUI extension does. CLAP gui alone has no notion of it.
+#define AAP_CLAP_EXT_GUI_VIEWPORT "org.androidaudioplugin.clap-hosting-helper/gui-viewport/1"
+
+typedef struct aap_clap_plugin_gui_viewport_t {
+    // [main-thread] Sets the viewport (the SurfaceView) size, the content size and the scroll
+    // position of the content, all in pixels. It can be called before show(); it takes effect
+    // once the plugin UI is connected.
+    bool (*configure)(const clap_plugin_t* plugin,
+                      uint32_t viewport_width, uint32_t viewport_height,
+                      uint32_t content_width, uint32_t content_height,
+                      uint32_t scroll_x, uint32_t scroll_y);
+} aap_clap_plugin_gui_viewport_t;
 
 // ---------------------------------------------------------------------------
 // aap-clap-hosting-helper: host-side AAP → CLAP adapter
