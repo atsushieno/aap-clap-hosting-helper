@@ -1,6 +1,6 @@
 [versions]
 
-aap-clap-hosting-helper = "0.1.1"
+aap-clap-hosting-helper = "0.1.2"
 aap-core = "0.12.0"
 
 android-compileSdk = "37"
