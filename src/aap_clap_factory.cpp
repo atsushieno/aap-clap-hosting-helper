@@ -152,7 +152,7 @@ const clap_plugin_t* AapClapFactory::createPlugin(const clap_host_t* host,
     if (!result.error.empty()) return nullptr;
 
     auto* instance = static_cast<aap::RemotePluginInstance*>(
-            _client->getInstanceById(result.value));
+            _client->getInstance(plugin_id, result.value));
     if (!instance) return nullptr;
 
     auto* plugin = new AapClapPlugin(desc, host, instance, _client);

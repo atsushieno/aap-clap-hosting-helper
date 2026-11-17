@@ -151,7 +151,7 @@ bool AapClapPresetDiscoveryProvider::getMetadata(
     if (!result.error.empty()) return false;
 
     auto* instance = static_cast<aap::RemotePluginInstance*>(
-            _client->getInstanceById(result.value));
+            _client->getInstance(_plugin_id.c_str(), result.value));
     if (!instance) return false;
 
     auto& ext = instance->getStandardExtensions();
